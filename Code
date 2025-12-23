@@ -1,0 +1,550 @@
+from machine import Pin, PWM, ADC, I2C 
+import time
+import math
+import os 
+from picographics import PicoGraphics, DISPLAY_PICO_DISPLAY, PEN_P4
+from pimoroni import RGBLED
+
+# --- Configuration du Hardware ---
+# RGB LED configuration
+led = RGBLED(6, 7, 8)
+# Display setup
+display = PicoGraphics(display=DISPLAY_PICO_DISPLAY, pen_type=PEN_P4, rotate=0)
+
+# --- Constantes et Couleurs ---
+WIDTH, HEIGHT = display.get_bounds()
+BACKLIGHT_FILE = "backlight_value.txt"
+SERVO_CONFIG_FILE = "servo_config.txt" # Nouveau fichier de configuration
+SERVO_DELAY_FILE = "servo_delay_ms.txt"
+FONT_SCALE = 0.5 # Taille de la police
+
+# Colors
+WHITE = display.create_pen(255, 255, 255)
+BLACK = display.create_pen(0, 0, 0)
+CYAN = display.create_pen(0, 255, 255)
+MAGENTA = display.create_pen(255, 0, 255)
+YELLOW = display.create_pen(255, 255, 0)
+GREEN = display.create_pen(0, 255, 0)
+RED = display.create_pen(255, 0, 0)
+BLUE = display.create_pen(0, 0, 255)
+ORANGE = display.create_pen(255, 165, 0)
+
+# --- Configuration des Boutons (Broches par défaut du Pico Display) ---
+BUTTON_A_PIN = 12 # Sortie/Sauvegarde Réglage Servo / Start/Stop Servo
+BUTTON_B_PIN = 13 # Backlight Menu
+BUTTON_X_PIN = 14 # Entrée Réglage Servo / Réglage +
+BUTTON_Y_PIN = 15 # Réglage -
+
+button_a = Pin(BUTTON_A_PIN, Pin.IN, Pin.PULL_UP)
+button_b = Pin(BUTTON_B_PIN, Pin.IN, Pin.PULL_UP)
+button_x = Pin(BUTTON_X_PIN, Pin.IN, Pin.PULL_UP)
+button_y = Pin(BUTTON_Y_PIN, Pin.IN, Pin.PULL_UP) 
+
+# --- Configuration du Servo ---
+SERVO_PIN = 0 
+PWM_FREQ = 50 
+
+pwm = PWM(Pin(SERVO_PIN))
+pwm.freq(PWM_FREQ)
+
+# Plages de Duty Cycle par défaut pour 0° et 180°
+DEFAULT_MIN_DUTY = 1500  # Position 0°
+DEFAULT_MAX_DUTY = 7500  # Position 180°
+IDLE_DUTY = 0    # Pour arrêter le PWM (optionnel)
+
+# Angles de butée (réglables par l'utilisateur)
+MIN_ANGLE = 0
+MAX_ANGLE = 180
+
+START_ANGLE = 90 # Angle de départ/neutre
+
+# --- État du programme ---
+servo_running = False # Variable pour suivre l'état du servomoteur
+
+# --- Fonctions de Sauvegarde/Chargement (Servo) ---
+
+def load_servo_config():
+    """Charge les angles min/max stockés ou retourne les valeurs par défaut."""
+    global MIN_ANGLE, MAX_ANGLE
+    try:
+        if SERVO_CONFIG_FILE in os.listdir():
+            with open(SERVO_CONFIG_FILE, "r") as f:
+                lines = f.readlines()
+                # Supposer que la première ligne est MIN_ANGLE, la seconde MAX_ANGLE
+                min_angle = int(lines[0].strip())
+                max_angle = int(lines[1].strip())
+                
+                # Validation de base
+                if 0 <= min_angle <= 180 and 0 <= max_angle <= 180 and min_angle < max_angle:
+                    MIN_ANGLE = min_angle
+                    MAX_ANGLE = max_angle
+                    print(f"Config servo chargée: Min={MIN_ANGLE}°, Max={MAX_ANGLE}°")
+                    return
+                
+        # Si fichier manquant, corrompu ou valeurs invalides, utiliser les valeurs par défaut
+        MIN_ANGLE = 0
+        MAX_ANGLE = 180
+        print("Config servo par défaut utilisée.")
+        
+    except (OSError, ValueError, IndexError) as e:
+        print(f"Erreur de chargement de la config servo ({e}). Utilisation des valeurs par défaut.")
+        MIN_ANGLE = 0
+        MAX_ANGLE = 180
+
+def save_servo_config():
+    """Sauvegarde les angles min/max actuels."""
+    try:
+        with open(SERVO_CONFIG_FILE, "w") as f:
+            f.write(f"{MIN_ANGLE}\n")
+            f.write(f"{MAX_ANGLE}\n")
+        print(f"Config servo sauvegardée: Min={MIN_ANGLE}°, Max={MAX_ANGLE}°")
+    except OSError as e:
+        print(f"Erreur de sauvegarde de la config servo: {e}")
+
+# --- Fonctions de Sauvegarde/Chargement (Rétroéclairage) ---
+
+def load_backlight_value():
+    """Loads the stored backlight level or returns a default."""
+    try:
+        if BACKLIGHT_FILE in os.listdir():
+            with open(BACKLIGHT_FILE, "r") as f:
+                level = float(f.read().strip())
+                return max(0.0, min(1.0, level))
+        else:
+             return 0.5 
+    except (OSError, ValueError):
+        return 0.5 
+
+def save_backlight_value(level):
+    """Saves the current backlight level."""
+    try:
+        with open(BACKLIGHT_FILE, "w") as f:
+            f.write(str(level))
+    except OSError as e:
+        print(f"Error saving backlight value: {e}")
+# --- Fonctions de Gestion de la Temporisation Servo ---
+def load_servo_delay():
+    """Charge le délai du servo (en ms) ou retourne une valeur par défaut."""
+    try:
+        if SERVO_DELAY_FILE in os.listdir():
+            with open(SERVO_DELAY_FILE, "r") as f:
+                # La valeur est enregistrée en ms, mais convertie en secondes pour time.sleep()
+                delay_ms = int(f.read().strip())
+                # S'assurer que le délai est dans une plage raisonnable (ex: 10 à 500 ms)
+                return max(10, min(500, delay_ms))
+        else:
+             return 50 # Valeur par défaut de 50 ms
+    except (OSError, ValueError):
+        return 50 # Valeur par défaut
+
+def save_servo_delay(delay_ms):
+    """Sauvegarde le délai du servo (en ms)."""
+    try:
+        with open(SERVO_DELAY_FILE, "w") as f:
+            f.write(str(int(delay_ms)))
+    except OSError as e:
+        print(f"Erreur lors de la sauvegarde du délai: {e}")
+
+# Initialisation des configurations
+load_servo_config()
+backlight_level = load_backlight_value()
+display.set_backlight(backlight_level)
+display.set_font("bitmap8")
+servo_delay_ms = load_servo_delay() 
+
+def clear_screen():
+    """Clears the display and turns off the LED."""
+    display.set_pen(BLACK)
+    led.set_rgb(0, 0, 0)
+    display.clear()
+    display.update()
+
+# --- Fonctions Servo ---
+
+def map_angle_to_duty(angle):
+    """ Convertit un angle (0-180) en une valeur de duty cycle PWM (DEFAULT_MIN_DUTY - DEFAULT_MAX_DUTY). """
+    # Utilisation des constantes de duty cycle pour le mapping 0-180
+    duty = int(DEFAULT_MIN_DUTY + (DEFAULT_MAX_DUTY - DEFAULT_MIN_DUTY) * (angle / 180))
+    # S'assurer que la valeur est dans la plage de duty cycle
+    return max(DEFAULT_MIN_DUTY, min(DEFAULT_MAX_DUTY, duty))
+
+def set_servo_angle(angle):
+    """ Définit l'angle du servomoteur, en respectant les limites MIN_ANGLE et MAX_ANGLE. """
+    # Clamper l'angle à la plage réglée par l'utilisateur
+    clamped_angle = max(MIN_ANGLE, min(MAX_ANGLE, angle))
+    
+    duty = map_angle_to_duty(clamped_angle)
+    pwm.duty_u16(duty)
+    return clamped_angle
+
+def stop_servo():
+    """ Arrête le signal PWM (met le duty cycle à 0). """
+    # set_servo_angle(0) pourrait être utilisé, mais duty_u16(0) est plus sûr pour un arrêt complet.
+    pwm.duty_u16(IDLE_DUTY) # Arrêt du signal PWM
+    
+# --- Écrans et Menus ---
+
+def refresh_main_screen():
+    """Redessine l'écran principal (état Arrêté)."""
+    global servo_running, MIN_ANGLE, MAX_ANGLE
+    clear_screen()
+    display.set_pen(GREEN)
+    display.set_font("bitmap8")
+    display.text("SERVO ARRETE", 0, 10, 240, 2)
+    display.set_pen(CYAN)
+    display.text(f"Min: {MIN_ANGLE}° Max: {MAX_ANGLE}°", 0, 30, 240, 2)
+    
+    display.set_pen(WHITE)
+    display.text("A : Demarrer Servo", 0, 50, 240, 2)
+    display.text("B : Regler Retro", 0, 70, 240, 2)
+    display.text("X : Regler Limites", 0, 90, 240, 2)
+    display.text("Y : Regler Temporisation", 0, 110, 240, 2)
+    display.update()
+
+def regler_retro_eclairage_mesure():
+    """Allows adjustment of the backlight level using X (+), Y (-), and B (Exit/Save)."""
+    global backlight_level
+    clear_screen()
+    
+    # Affichage des instructions
+    display.set_pen(WHITE)
+    display.text("REGLAGE RETRO ECLAIRAGE", 10, 10, 240, 2)
+    display.text("X : +0.05", 10, 70, 240, 2)
+    display.text("Y : -0.05", 10, 90, 240, 2)
+    display.text("B : Terminer & Sauver", 10, 110, 240, 2)
+    display.update()
+
+    last_x_state = button_x.value()
+    last_y_state = button_y.value()
+    last_b_state = button_b.value() 
+    prev_backlight_affichage = -1.0
+    backlight_step = 0.05 
+
+    while True:
+        current_x_state = button_x.value()
+        current_b_state = button_b.value()
+        current_y_state = button_y.value() 
+
+        # Button X pressed (Front descendant: 1 -> 0)
+        if current_x_state == 0 and last_x_state == 1:
+            backlight_level = min(backlight_level + backlight_step, 1.0)
+            display.set_backlight(backlight_level)
+        
+        # Button Y pressed (Front descendant: 1 -> 0)
+        if current_y_state == 0 and last_y_state == 1:
+            backlight_level = max(backlight_level - backlight_step, 0.0)
+            display.set_backlight(backlight_level)
+        
+        # Button B pressed (Front descendant: 1 -> 0) - Exit and save
+        if current_b_state == 0 and last_b_state == 1:
+            save_backlight_value(backlight_level)
+            # Pas besoin de rafraîchir les états des boutons ici, ils seront rafraîchis dans la boucle principale.
+            print("Sortie du réglage du rétroéclairage.")            
+            return # Sortie de la fonction
+        
+        # Mise à jour de l'affichage du niveau 
+        if abs(backlight_level - prev_backlight_affichage) > 0.01:
+            display.set_pen(BLACK)
+            display.rectangle(0, 35, 240, 30)
+            display.set_pen(YELLOW)
+            display.text(f"Retro: {backlight_level:.2f}", 10, 40, 240, 2)
+            display.update()
+            prev_backlight_affichage = backlight_level
+
+        
+        last_x_state = current_x_state
+        last_b_state = current_b_state
+        last_y_state = current_y_state 
+            
+        time.sleep(0.01)
+
+def regler_temporisation_servo():
+    """Permet l'ajustement du délai du servomoteur (en ms) utilisant X (+), Y (-), et A (Exit/Save)."""
+    global servo_delay_ms
+    clear_screen()
+    
+    # Affichage des instructions
+    display.set_pen(WHITE)
+    display.text("REGLAGE TEMPORISATION", 10, 10, 240, 2)
+    display.text("Y : -10 ms", 10, 70, 240, 2)
+    display.text("X : +10 ms", 10, 90, 240, 2)
+    display.text("A : Terminer & Sauver", 10, 110, 240, 2)
+    display.update()
+
+    last_a_state = button_a.value()
+    last_x_state = button_x.value()
+    last_y_state = button_y.value()
+    prev_delay_affichage = -1
+    delay_step = 10 # Pas de 10 millisecondes
+    MIN_DELAY = 10 # Minimum 10 ms
+    MAX_DELAY = 500 # Maximum 500 ms
+
+    while True:
+        current_a_state = button_a.value()
+        current_x_state = button_x.value()
+        current_y_state = button_y.value()
+
+        # Button Y pressed (Front descendant: 1 -> 0) - Diminuer
+        if current_y_state == 0 and last_y_state == 1:
+            servo_delay_ms = max(servo_delay_ms - delay_step, MIN_DELAY)
+        
+        # Button X pressed (Front descendant: 1 -> 0) - Augmenter
+        if current_x_state == 0 and last_x_state == 1:
+            servo_delay_ms = min(servo_delay_ms + delay_step, MAX_DELAY)
+        
+        # Button A pressed (Front descendant: 1 -> 0) - Exit and save
+        if current_a_state == 0 and last_a_state == 1:
+            save_servo_delay(servo_delay_ms)
+            break
+        
+        # Mise à jour de l'affichage du délai
+        if servo_delay_ms != prev_delay_affichage:
+            display.set_pen(BLACK)
+            display.rectangle(0, 35, 240, 30)
+            display.set_pen(ORANGE)
+            display.text(f"Delai: {servo_delay_ms} ms", 10, 40, 240, 2)
+            display.update()
+            prev_delay_affichage = servo_delay_ms
+
+        last_a_state = current_a_state
+        last_x_state = current_x_state
+        last_y_state = current_y_state
+            
+        time.sleep(0.01)
+
+def regler_servo_limites():
+    """Permet le réglage des positions min et max du servo."""
+    global MIN_ANGLE, MAX_ANGLE
+    
+    # Copie temporaire pour les réglages en cours
+    current_min = MIN_ANGLE
+    current_max = MAX_ANGLE
+    
+    # 0: Réglage Min, 1: Réglage Max
+    mode_reglage = 0 
+    
+    clear_screen()
+    
+    def draw_reglage_screen(mode, min_val, max_val):
+        display.set_pen(BLACK)
+        display.clear()
+        
+        display.set_pen(WHITE)
+        display.text("REGLAGE LIMITES SERVO", 10, 10, 240, 2)
+        display.text("X : Augmenter (+1°)", 10, 100, 240, 1)
+        display.text("Y : Diminuer (-1°)", 10, 115, 240, 1)
+        display.text("B : Changer Mode (Min/Max)", 10, 130, 240, 1)
+        display.text("A : Sauvegarder & Quitter", 10, 145, 240, 1)
+        
+        # Affichage de MIN_ANGLE
+        display.set_pen(YELLOW if mode == 0 else WHITE)
+        display.text(f"MIN ANGLE: {min_val}°", 10, 40, 240, 2)
+
+        # Affichage de MAX_ANGLE
+        display.set_pen(YELLOW if mode == 1 else WHITE)
+        display.text(f"MAX ANGLE: {max_val}°", 10, 65, 240, 2)
+        
+        display.update()
+        
+        # Mettre le servo en position min ou max (sans sauvegarde)
+        if mode == 0:
+            set_servo_angle(min_val)
+        else:
+            set_servo_angle(max_val)
+
+
+    # Initialisation de l'affichage
+    draw_reglage_screen(mode_reglage, current_min, current_max)
+    
+    last_a_state = button_a.value()
+    last_b_state = button_b.value()
+    last_x_state = button_x.value()
+    last_y_state = button_y.value()
+
+    while True:
+        current_a_state = button_a.value()
+        current_b_state = button_b.value()
+        current_x_state = button_x.value()
+        current_y_state = button_y.value()
+
+        changed = False
+
+        # Bouton A (Quitter et Sauvegarder)
+        if current_a_state == 0 and last_a_state == 1:
+            if current_min < current_max:
+                MIN_ANGLE = current_min
+                MAX_ANGLE = current_max
+                save_servo_config()
+                print("Sortie du réglage des limites servo (Sauvegardé).")
+                break
+            else:
+                # Alerte visuelle ou message si Min >= Max
+                display.set_pen(RED)
+                display.text("ERREUR: MIN >= MAX", 10, 85, 240, 1)
+                display.update()
+                time.sleep(0.5)
+                # Redessiner pour effacer l'erreur
+                draw_reglage_screen(mode_reglage, current_min, current_max)
+
+
+        # Bouton B (Changer de mode : Min/Max)
+        if current_b_state == 0 and last_b_state == 1:
+            mode_reglage = 1 - mode_reglage # Bascule entre 0 et 1
+            changed = True
+            print(f"Mode réglage : {'MAX' if mode_reglage == 1 else 'MIN'}")
+
+        # Bouton X (Augmenter +1°)
+        if current_x_state == 0 and last_x_state == 1:
+            if mode_reglage == 0: # Réglage Min
+                current_min = min(current_min + 1, 180)
+            else: # Réglage Max
+                current_max = min(current_max + 1, 180)
+            changed = True
+
+        # Bouton Y (Diminuer -1°)
+        if current_y_state == 0 and last_y_state == 1:
+            if mode_reglage == 0: # Réglage Min
+                current_min = max(current_min - 1, 0)
+            else: # Réglage Max
+                current_max = max(current_max - 1, 0)
+            changed = True
+        
+        # Si une valeur a été modifiée ou le mode a changé, mettre à jour l'affichage
+        if changed:
+            draw_reglage_screen(mode_reglage, current_min, current_max)
+            
+        last_a_state = current_a_state
+        last_b_state = current_b_state
+        last_x_state = current_x_state
+        last_y_state = current_y_state
+            
+        time.sleep(0.01) # Pour le debounce
+
+    # Sortie de la boucle de réglage
+    stop_servo() # Arrêter le servo après le réglage
+    # L'appelant s'occupera du rafraîchissement de l'écran principal
+
+
+# --- Boucle de Démarrage (Définition de l'état initial) ---
+stop_servo()
+refresh_main_screen()
+
+# --- Boucle Principale de Contrôle ---
+
+print("Démarrage du programme de contrôle du Servomoteur.")
+
+try:
+    current_angle = MIN_ANGLE
+    last_a_state = button_a.value()
+    last_b_state = button_b.value()
+    last_x_state = button_x.value()
+    last_y_state = button_y.value()
+    
+    while True:
+        current_a_state = button_a.value()
+        current_b_state = button_b.value()
+        current_x_state = button_x.value()
+        current_y_state = button_y.value()
+
+        button_a_pressed = current_a_state == 0 and last_a_state == 1
+        button_b_pressed = current_b_state == 0 and last_b_state == 1
+        button_x_pressed = current_x_state == 0 and last_x_state == 1 # Nouveau
+        button_y_pressed = current_y_state == 0 and last_x_state == 1
+
+        # ----------------------------------------
+        # Logique de Démarrage/Arrêt du Servo (Bouton A)
+        # ----------------------------------------
+        if button_a_pressed:
+            servo_running = not servo_running
+            
+            if servo_running:
+                # Démarrage
+                clear_screen()
+                display.set_pen(RED)
+                display.text("SERVO EN COURS", 0, 20, 240, 2)
+                display.set_pen(WHITE)
+                display.text("A : Arreter Servo", 0, 50, 240, 2)
+                display.text(f"Angle Min:{MIN_ANGLE}° Max:{MAX_ANGLE}°", 0, 70, 240, 1)
+                display.update()
+                current_angle = MIN_ANGLE # Redémarrer à l'angle min
+                print("Servo Démarré.")
+            else:
+                # Arrêt
+                stop_servo()
+                refresh_main_screen()
+                print("Servo Arrêté.")
+        
+        # ----------------------------------------
+        # Logique de Rétroéclairage (Bouton B)
+        # ----------------------------------------
+        if button_b_pressed and not servo_running:
+            # Entrer dans le menu de réglage du rétroéclairage
+            print("Entrée dans le réglage du rétroéclairage.")
+            regler_retro_eclairage_mesure()
+            refresh_main_screen()
+            print("Sortie du réglage du rétroéclairage.")
+        
+        # ----------------------------------------
+        # Logique de Réglage Servo (Bouton X)
+        # ----------------------------------------
+        if button_x_pressed and not servo_running:
+            # Entrer dans le menu de réglage des limites servo
+            print("Entrée dans le réglage des limites servo.")
+            regler_servo_limites()
+            refresh_main_screen()
+            print("Sortie du réglage des limites servo.")
+            
+        # ----------------------------------------
+        # Logique de Temporisation Servo (Bouton Y)
+        # ----------------------------------------
+        if button_y_pressed and not servo_running:
+            # Entrer dans le menu de réglage de la temporisation
+            print("Entrée dans le réglage de la temporisation du servo.")
+            regler_temporisation_servo()
+            # Une fois sorti du menu, rafraîchir l'écran principal
+            refresh_main_screen()
+            print("Sortie du réglage de la temporisation du servo.")
+            
+        # ----------------------------------------
+        # Logique de Mouvement (seulement si 'servo_running' est True)
+        # ----------------------------------------
+        if servo_running:
+            # *Exemple de mouvement : Balayage simple entre MIN_ANGLE et MAX_ANGLE*
+            # Utiliser une variable pour la direction du balayage
+            if 'sweep_direction' not in locals():
+                sweep_direction = 1 # 1 pour augmenter, -1 pour diminuer
+            
+            # Changer l'angle
+            current_angle += 1 * sweep_direction
+            
+            # Inverser la direction si les limites sont atteintes
+            if current_angle >= MAX_ANGLE:
+                sweep_direction = -1
+                current_angle = MAX_ANGLE # Clamper l'angle exact
+            elif current_angle <= MIN_ANGLE:
+                sweep_direction = 1
+                current_angle = MIN_ANGLE # Clamper l'angle exact
+                
+            set_servo_angle(current_angle)
+            time.sleep(0.02) # Vitesse du balayage
+            
+            # Afficher l'angle actuel (optionnel)
+            display.set_pen(BLACK)
+            display.rectangle(0, 90, 240, 20)
+            display.set_pen(YELLOW)
+            display.text(f"Angle Actuel: {current_angle}°", 0, 90, 240, 2)
+            display.update()
+        
+        last_a_state = current_a_state
+        last_b_state = current_b_state
+        last_x_state = current_x_state
+        
+        time.sleep(0.01) 
+
+except KeyboardInterrupt:
+    print("Programme arrêté par l'utilisateur.")
+
+finally:
+    # Arrêter le signal PWM et nettoyer les ressources
+    pwm.deinit()
+    print("PWM désactivé. Fin du programme.")
